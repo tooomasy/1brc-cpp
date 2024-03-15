@@ -183,19 +183,37 @@ real_inline uint64_t findNext(char* buf, uint64_t startIdx, uint64_t endIdx,
 
 real_inline void processChunk(LinearProbeHash& count, char* buf,
                               uint64_t startIdx, uint64_t endIdx) {
+  uint64_t offset = startIdx;
   while (startIdx < endIdx) {
-    uint64_t semiColonIdx = findNext(buf, startIdx, endIdx, ';');
-    std::string_view stationName(buf + startIdx, semiColonIdx - startIdx);
+    // std::cout << "start=" << startIdx << " endIdx=" << endIdx << "\n";
+    // clang-format off
+    __m256i dataMask1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + startIdx));
+    __m256i dataMask2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + startIdx + 32));
+    __m256i semiColonMask = _mm256_set1_epi8(';');
+    uint32_t cmpMask1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(dataMask1, semiColonMask));
+    uint32_t cmpMask2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(dataMask2, semiColonMask));
+    uint64_t cmpMask = (static_cast<uint64_t>(cmpMask2) << 32U) | cmpMask1;
+    // clang-format on
 
-    bool sign = buf[semiColonIdx + 1] == '-';
-    startIdx = semiColonIdx + (sign);
+    while (cmpMask > 0 && offset < endIdx) {
+      // std::cout << offset << " " << endIdx << "\n";
+      uint64_t semiColonIdx = __builtin_ctzll(cmpMask) + startIdx;
+      // std::cout << "semi=" << semiColonIdx << "\n";
+      std::string_view stationName(buf + offset, semiColonIdx - (offset));
 
-    uint64_t newLineIdx = startIdx + 4 + (buf[startIdx + 3] == '.');
-    std::string_view temperature(buf + startIdx + 1, newLineIdx - startIdx - 1);
-    startIdx = newLineIdx + 1;
+      bool sign = buf[semiColonIdx + 1] == '-';
+      offset = semiColonIdx + (sign);
 
-    // std::cout << "[" << stationName << "] " << temperature << "\n";
-    aggregation(count, stationName, parseInt(temperature) * (sign ? -1 : 1));
+      uint64_t newLineIdx = offset + 4 + (buf[offset + 3] == '.');
+      std::string_view temperature(buf + offset + 1, newLineIdx - offset - 1);
+      offset = newLineIdx + 1;
+
+      // std::cout << "[" << stationName << "] " << temperature << "\n";
+      aggregation(count, stationName, parseInt(temperature) * (sign ? -1 : 1));
+
+      cmpMask = cmpMask & (cmpMask - 1);
+    }
+    startIdx += 64;
   }
 }
 
