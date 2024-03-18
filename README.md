@@ -7,7 +7,7 @@ The One Billion Row Challenge (1BRC) is a challenge that aims to aggregate one b
 | Implementation                                                            |   Time  |
 |---------------------------------------------------------------------------|:-------:|
 | [lehuyduc](https://github.com/lehuyduc/1brc-simd)                         |  5.575s |
-| [tooomasy](https://github.com/tooomasy/1brc-cpp)                          |  8.413s |
+| [tooomasy](https://github.com/tooomasy/1brc-cpp)                          |  ~~8.413s~~ 7.640s |
 | [kajott](https://gist.github.com/kajott/8a7c3f56a9a035fdfe3b2c79e17c8eed) | 10.580s |
 
 ### Key features of the implementation include:

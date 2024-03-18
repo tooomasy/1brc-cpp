@@ -76,8 +76,7 @@ struct LinearProbeHash {
  private:
   using HashInfo = StationResult;
 
-  static inline constexpr int MAX_BUCKET = 1 << 14;
-  static inline constexpr uint64_t HASH_CONSTANT = 0x517cc1b727220a95;
+  static inline constexpr uint32_t MAX_BUCKET = 1 << 14;
   alignas(4096) static inline constexpr std::array<uint8_t, 64> idxMask = []() {
     std::array<uint8_t, 64> res{};
     for (int i = 0; i < 32; ++i) {
@@ -89,7 +88,7 @@ struct LinearProbeHash {
   alignas(4096) std::array<HashInfo, MAX_BUCKET> data;
   std::vector<StationResult*> resultInfo;
 
-  static inline uint64_t hash(std::string_view key) {
+  static inline uint32_t hash(std::string_view key) {
     return std::hash<std::string_view>{}(key) % MAX_BUCKET;
   }
 
@@ -102,7 +101,7 @@ struct LinearProbeHash {
   const std::array<HashInfo, MAX_BUCKET>& getRawData() const { return data; };
 
   StationResult& get(const std::string_view key) {
-    uint64_t hashKey = hash(key);
+    uint32_t hashKey = hash(key);
     while (data[hashKey].len > 0) {
       assert(key.length() <= 32);
       // clang-format off
@@ -150,25 +149,22 @@ void outputResult(const std::vector<StationResult*>& result,
 }
 
 real_inline int parseInt(std::string_view str) {
-  if (str.size() == 4) {
-    int res = 0;
-    res += (str[0] - '0') * 100;
-    res += (str[1] - '0') * 10;
-    res += (str[3] - '0');
-    return res;
-  } else {
-    int res = 0;
-    res += (str[0] - '0') * 10;
-    res += (str[2] - '0');
-    return res;
-  }
+  int res = 0;
+  res += (str[str.size() - 1] - '0') + (str[str.size() - 3] - '0') * 10 +
+         (str[str.size() - 4] - '0') * 100 * (str.size() == 4);
+  return res;
 }
 
 real_inline void aggregation(LinearProbeHash& count,
                              std::string_view stationName, int temperature) {
   StationResult& result = count.get(stationName);
-  result.max = std::max(result.max, temperature);
-  result.min = std::min(result.min, temperature);
+  if (result.max < temperature) [[unlikely]] {
+    result.max = temperature;
+  }
+
+  if (result.min > temperature) [[unlikely]] {
+    result.min = temperature;
+  }
   result.total += temperature;
   ++result.n;
 }
@@ -181,53 +177,125 @@ real_inline uint64_t findNext(char* buf, uint64_t startIdx, uint64_t endIdx,
   return startIdx;
 }
 
-real_inline void processChunk(LinearProbeHash& count, char* buf,
-                              uint64_t startIdx, uint64_t endIdx) {
-  uint64_t offset = startIdx;
-  while (startIdx < endIdx) {
-    // std::cout << "start=" << startIdx << " endIdx=" << endIdx << "\n";
-    // clang-format off
-    __m256i dataMask1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + startIdx));
-    __m256i dataMask2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + startIdx + 32));
-    __m256i semiColonMask = _mm256_set1_epi8(';');
-    uint32_t cmpMask1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(dataMask1, semiColonMask));
-    uint32_t cmpMask2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(dataMask2, semiColonMask));
-    uint64_t cmpMask = (static_cast<uint64_t>(cmpMask2) << 32U) | cmpMask1;
-    // clang-format on
+inline uint64_t getDelimiterMaskWithSimd(char* buf, uint64_t startIdx) {
+  // clang-format off
+  __m256i dataMask1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + startIdx));
+  __m256i dataMask2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + startIdx + 32));
+  __m256i semiColonMask = _mm256_set1_epi8(';');
+  uint32_t cmpMask1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(dataMask1, semiColonMask));
+  uint32_t cmpMask2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(dataMask2, semiColonMask));
+  uint64_t cmpMask = (static_cast<uint64_t>(cmpMask2) << 32U) | cmpMask1;
+  // clang-format on
+  return cmpMask;
+}
 
-    while (cmpMask > 0 && offset < endIdx) {
-      // std::cout << offset << " " << endIdx << "\n";
-      uint64_t semiColonIdx = __builtin_ctzll(cmpMask) + startIdx;
-      // std::cout << "semi=" << semiColonIdx << "\n";
-      std::string_view stationName(buf + offset, semiColonIdx - (offset));
+inline void processChunk(LinearProbeHash& count, char* buf, uint64_t startIdx,
+                         uint64_t endIdx) {
+  while (startIdx < endIdx) [[likely]] {
+    uint64_t cmpMask = getDelimiterMaskWithSimd(buf, startIdx);
 
-      bool sign = buf[semiColonIdx + 1] == '-';
-      offset = semiColonIdx + (sign);
+    uint64_t semiColonIdx = __builtin_ctzll(cmpMask) + startIdx;
+    std::string_view stationName(buf + startIdx, semiColonIdx - (startIdx));
 
-      uint64_t newLineIdx = offset + 4 + (buf[offset + 3] == '.');
-      std::string_view temperature(buf + offset + 1, newLineIdx - offset - 1);
-      offset = newLineIdx + 1;
+    bool sign = buf[semiColonIdx + 1] == '-';
+    startIdx = semiColonIdx + (sign);
 
-      // std::cout << "[" << stationName << "] " << temperature << "\n";
-      aggregation(count, stationName, parseInt(temperature) * (sign ? -1 : 1));
+    uint64_t newLineIdx = startIdx + 4 + (buf[startIdx + 3] == '.');
+    std::string_view temperature(buf + startIdx + 1, newLineIdx - startIdx - 1);
+    startIdx = newLineIdx + 1;
 
-      cmpMask = cmpMask & (cmpMask - 1);
-    }
-    startIdx += 64;
+    aggregation(count, stationName, parseInt(temperature) * (sign ? -1 : 1));
+  }
+}
+
+inline void processChunkUnroll(LinearProbeHash& count, char* buf, uint64_t sidx,
+                               uint64_t eidx) {
+  const uint64_t subChunkSize = (eidx - sidx) / 3;
+  uint64_t startIdx0 = sidx;
+  uint64_t endIdx0 = startIdx0 + subChunkSize;
+  uint64_t startIdx1 = findNext(buf, endIdx0, eidx, '\n') + 1;
+  uint64_t endIdx1 = eidx;
+
+  while (true) {
+    if (startIdx0 >= endIdx0) [[unlikely]]
+      break;
+    if (startIdx1 >= endIdx1) [[unlikely]]
+      break;
+
+    uint64_t nameStartIdx0 = startIdx0;
+    uint64_t nameStartIdx1 = startIdx1;
+
+    uint64_t cmpMask0 = getDelimiterMaskWithSimd(buf, startIdx0);
+    uint64_t cmpMask1 = getDelimiterMaskWithSimd(buf, startIdx1);
+
+    uint64_t semiColonIdx0 = __builtin_ctzll(cmpMask0) + startIdx0;
+    uint64_t semiColonIdx1 = __builtin_ctzll(cmpMask1) + startIdx1;
+
+    bool sign0 = buf[semiColonIdx0 + 1] == '-';
+    bool sign1 = buf[semiColonIdx1 + 1] == '-';
+
+    startIdx0 = semiColonIdx0 + (sign0);
+    startIdx1 = semiColonIdx1 + (sign1);
+
+    uint64_t newLineIdx0 = startIdx0 + 4 + (buf[startIdx0 + 3] == '.');
+    uint64_t newLineIdx1 = startIdx1 + 4 + (buf[startIdx1 + 3] == '.');
+
+    std::string_view stationName0(buf + nameStartIdx0,
+                                  semiColonIdx0 - nameStartIdx0);
+    std::string_view stationName1(buf + nameStartIdx1,
+                                  semiColonIdx1 - nameStartIdx1);
+
+    std::string_view temperature0(buf + startIdx0 + 1,
+                                  newLineIdx0 - startIdx0 - 1);
+    std::string_view temperature1(buf + startIdx1 + 1,
+                                  newLineIdx1 - startIdx1 - 1);
+
+    startIdx0 = newLineIdx0 + 1;
+    startIdx1 = newLineIdx1 + 1;
+
+    aggregation(count, stationName0, parseInt(temperature0) * (sign0 ? -1 : 1));
+    aggregation(count, stationName1, parseInt(temperature1) * (sign1 ? -1 : 1));
+  }
+
+  while (startIdx0 < endIdx0) [[likely]] {
+    uint64_t nameStartIdx0 = startIdx0;
+    uint64_t cmpMask0 = getDelimiterMaskWithSimd(buf, startIdx0);
+    uint64_t semiColonIdx0 = __builtin_ctzll(cmpMask0) + startIdx0;
+
+    bool sign0 = buf[semiColonIdx0 + 1] == '-';
+    startIdx0 = semiColonIdx0 + (sign0);
+
+    uint64_t newLineIdx0 = startIdx0 + 4 + (buf[startIdx0 + 3] == '.');
+    std::string_view stationName0(buf + nameStartIdx0,
+                                  semiColonIdx0 - nameStartIdx0);
+    std::string_view temperature0(buf + startIdx0 + 1,
+                                  newLineIdx0 - startIdx0 - 1);
+    startIdx0 = newLineIdx0 + 1;
+    aggregation(count, stationName0, parseInt(temperature0) * (sign0 ? -1 : 1));
+  }
+
+  while (startIdx1 < endIdx1) [[likely]] {
+    uint64_t nameStartIdx1 = startIdx1;
+    uint64_t cmpMask1 = getDelimiterMaskWithSimd(buf, startIdx1);
+    uint64_t semiColonIdx1 = __builtin_ctzll(cmpMask1) + startIdx1;
+
+    bool sign1 = buf[semiColonIdx1 + 1] == '-';
+    startIdx1 = semiColonIdx1 + (sign1);
+
+    uint64_t newLineIdx1 = startIdx1 + 4 + (buf[startIdx1 + 3] == '.');
+    std::string_view stationName1(buf + nameStartIdx1,
+                                  semiColonIdx1 - nameStartIdx1);
+    std::string_view temperature1(buf + startIdx1 + 1,
+                                  newLineIdx1 - startIdx1 - 1);
+    startIdx1 = newLineIdx1 + 1;
+    aggregation(count, stationName1, parseInt(temperature1) * (sign1 ? -1 : 1));
   }
 }
 
 void parallelTask(LinearProbeHash& count, char* buf, uint64_t startIdx,
                   uint64_t endIdx) {
-  // uint64_t chunk1Start = startIdx;
-  // uint64_t chunk1End = (endIdx - startIdx) / 2 + startIdx;
-  //
-  // uint64_t chunk2Start = findNext(buf, chunk1End, endIdx, '\n') + 1;
-  // uint64_t chunk2End = endIdx;
-  //
-  // processChunk(count, buf, chunk1Start, chunk2Start);
-  // processChunk(count, buf, chunk2Start, chunk2End);
-  processChunk(count, buf, startIdx, endIdx);
+  // processChunk(count, buf, startIdx, endIdx);
+  processChunkUnroll(count, buf, startIdx, endIdx);
 }
 
 int main(int argc, char* argv[]) {
